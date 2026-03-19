@@ -258,8 +258,12 @@ fn build_bal_payload(
 
 async fn run_integration_test() -> Result<()> {
     let rpc_url = "http://localhost:8545";
-    let provider = Provider::<Http>::try_from(rpc_url)?.interval(Duration::from_millis(50));
-    let http_client = Client::new();
+    let http_client = Client::builder().no_proxy().build()?;
+    let provider = Provider::new(Http::new_with_client(
+        reqwest::Url::parse(rpc_url)?,
+        http_client.clone(),
+    ))
+    .interval(Duration::from_millis(50));
 
     info!("Connecting to local BSC node at {}", rpc_url);
 
