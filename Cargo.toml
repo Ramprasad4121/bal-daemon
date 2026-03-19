@@ -3,6 +3,10 @@ name = "bal-daemon"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "integration_test"
+path = "src/bin/integration_test.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 ethers = { version = "2.0", features = ["ws"] }
