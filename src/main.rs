@@ -577,3 +577,154 @@ async fn main() -> Result<()> {
     info!("Head subscription ended.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlp::Rlp;
+
+    #[test]
+    fn test_rlp_round_trip() {
+        let original = BlockAccessListEncode {
+            version: 0,
+            number: 12_345_678,
+            hash: [0xab; 32],
+            sign_data: Vec::new(),
+            accounts: vec![AccountAccessListEncode {
+                tx_index: 0,
+                address: [0xcd; 20],
+                storage_items: vec![
+                    StorageAccessItem {
+                        tx_index: 0,
+                        dirty: false,
+                        key: [0x11; 32],
+                    },
+                    StorageAccessItem {
+                        tx_index: 0,
+                        dirty: true,
+                        key: [0x22; 32],
+                    },
+                ],
+            }],
+        };
+
+        let encoded = original.rlp_encode();
+        let decoded = Rlp::new(&encoded);
+
+        let version: u32 = decoded
+            .val_at(0)
+            .expect("failed to decode version from RLP payload");
+        assert_eq!(version, 0, "version mismatch after RLP round trip");
+
+        let number: u64 = decoded
+            .val_at(1)
+            .expect("failed to decode block number from RLP payload");
+        assert_eq!(
+            number, 12_345_678,
+            "block number mismatch after RLP round trip"
+        );
+
+        let hash: Vec<u8> = decoded
+            .val_at(2)
+            .expect("failed to decode block hash from RLP payload");
+        assert_eq!(
+            hash,
+            original.hash.to_vec(),
+            "block hash mismatch after RLP round trip"
+        );
+
+        let accounts = decoded
+            .at(4)
+            .expect("failed to decode accounts list from RLP payload");
+        assert_eq!(
+            accounts
+                .item_count()
+                .expect("failed to count accounts in RLP"),
+            1,
+            "accounts length mismatch after RLP round trip"
+        );
+
+        let first_account = accounts
+            .at(0)
+            .expect("failed to decode first account from RLP payload");
+        let account_tx_index: u32 = first_account
+            .val_at(0)
+            .expect("failed to decode account tx_index from RLP payload");
+        assert_eq!(
+            account_tx_index, 0,
+            "account tx_index mismatch after RLP round trip"
+        );
+
+        let account_address: Vec<u8> = first_account
+            .val_at(1)
+            .expect("failed to decode account address from RLP payload");
+        assert_eq!(
+            account_address,
+            original.accounts[0].address.to_vec(),
+            "account address mismatch after RLP round trip"
+        );
+
+        let storage_items = first_account
+            .at(2)
+            .expect("failed to decode storage items from RLP payload");
+        assert_eq!(
+            storage_items
+                .item_count()
+                .expect("failed to count storage items in RLP"),
+            2,
+            "storage item count mismatch after RLP round trip"
+        );
+
+        let first_storage_item = storage_items
+            .at(0)
+            .expect("failed to decode first storage item from RLP payload");
+        let first_storage_tx_index: u32 = first_storage_item
+            .val_at(0)
+            .expect("failed to decode first storage tx_index from RLP payload");
+        assert_eq!(
+            first_storage_tx_index, 0,
+            "first storage tx_index mismatch after RLP round trip"
+        );
+        let first_storage_dirty: u8 = first_storage_item
+            .val_at(1)
+            .expect("failed to decode first storage dirty flag from RLP payload");
+        assert_eq!(
+            first_storage_dirty, 0,
+            "first storage dirty flag mismatch after RLP round trip"
+        );
+        let first_storage_key: Vec<u8> = first_storage_item
+            .val_at(2)
+            .expect("failed to decode first storage key from RLP payload");
+        assert_eq!(
+            first_storage_key,
+            original.accounts[0].storage_items[0].key.to_vec(),
+            "first storage key mismatch after RLP round trip"
+        );
+
+        let second_storage_item = storage_items
+            .at(1)
+            .expect("failed to decode second storage item from RLP payload");
+        let second_storage_tx_index: u32 = second_storage_item
+            .val_at(0)
+            .expect("failed to decode second storage tx_index from RLP payload");
+        assert_eq!(
+            second_storage_tx_index, 0,
+            "second storage tx_index mismatch after RLP round trip"
+        );
+        let second_storage_dirty: u8 = second_storage_item
+            .val_at(1)
+            .expect("failed to decode second storage dirty flag from RLP payload");
+        assert_eq!(
+            second_storage_dirty, 1,
+            "second storage dirty flag mismatch after RLP round trip"
+        );
+        let second_storage_key: Vec<u8> = second_storage_item
+            .val_at(2)
+            .expect("failed to decode second storage key from RLP payload");
+        assert_eq!(
+            second_storage_key,
+            original.accounts[0].storage_items[1].key.to_vec(),
+            "second storage key mismatch after RLP round trip"
+        );
+    }
+}
