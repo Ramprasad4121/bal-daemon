@@ -1,9 +1,15 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use ethers::providers::{Middleware, Provider, Ws};
-use ethers::types::{Address, H256};
+use ethers::types::{Address, BlockNumber, Transaction, H256};
 use futures_util::StreamExt;
 use rlp::RlpStream;
 use std::collections::HashSet;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 // BEP-592 structs
@@ -31,15 +37,35 @@ struct BlockAccessListEncode {
     accounts: Vec<AccountAccessListEncode>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HeadContext {
+    number: u64,
+    hash: H256,
+}
+
+#[derive(Debug, Default)]
+struct SimulationCounters {
+    fresh: AtomicU64,
+    stale: AtomicU64,
+}
+
 impl StorageAccessItem {
     fn new(tx_index: u32, dirty: bool, key: H256) -> Self {
-        Self { tx_index, dirty, key: key.into() }
+        Self {
+            tx_index,
+            dirty,
+            key: key.into(),
+        }
     }
 }
 
 impl AccountAccessListEncode {
     fn new(tx_index: u32, address: Address) -> Self {
-        Self { tx_index, address: address.into(), storage_items: Vec::new() }
+        Self {
+            tx_index,
+            address: address.into(),
+            storage_items: Vec::new(),
+        }
     }
 }
 
@@ -75,6 +101,25 @@ impl BlockAccessListEncode {
             }
         }
         s.out().to_vec()
+    }
+}
+
+impl SimulationCounters {
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.fresh.load(Ordering::Relaxed),
+            self.stale.load(Ordering::Relaxed),
+        )
+    }
+
+    fn record_fresh(&self) -> (u64, u64) {
+        self.fresh.fetch_add(1, Ordering::Relaxed);
+        self.snapshot()
+    }
+
+    fn record_stale(&self) -> (u64, u64) {
+        self.stale.fetch_add(1, Ordering::Relaxed);
+        self.snapshot()
     }
 }
 
@@ -168,6 +213,166 @@ fn parse_prestate_diff(
     output
 }
 
+fn build_trace_call_body(pending_tx: &Transaction, block_number: u64) -> serde_json::Value {
+    let call_obj = serde_json::json!({
+        "from": format!("{:#x}", pending_tx.from),
+        "to": pending_tx.to.map(|a| format!("{:#x}", a)),
+        "data": format!("0x{}", hex::encode(pending_tx.input.as_ref())),
+        "gas": format!("{:#x}", pending_tx.gas),
+        "gasPrice": pending_tx.gas_price.map(|g| format!("{:#x}", g)),
+        "value": format!("{:#x}", pending_tx.value),
+    });
+
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "debug_traceCall",
+        "params": [
+            call_obj,
+            format!("{:#x}", block_number),
+            {
+                "tracer": "prestateTracer",
+                "tracerConfig": { "diffMode": true }
+            }
+        ],
+        "id": 1
+    })
+}
+
+async fn trace_call(
+    http_client: &reqwest::Client,
+    http_url: &str,
+    rpc_body: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let resp = http_client
+        .post(http_url)
+        .json(&rpc_body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let resp_json: serde_json::Value = resp.json().await?;
+
+    if let Some(error) = resp_json.get("error") {
+        bail!(
+            "debug_traceCall returned error: {}",
+            serde_json::to_string(error).unwrap_or_default()
+        );
+    }
+
+    let Some(result) = resp_json.get("result") else {
+        bail!(
+            "No result field. Response: {}",
+            serde_json::to_string(&resp_json).unwrap_or_default()
+        );
+    };
+
+    Ok(result.clone())
+}
+
+fn log_simulation_totals(counters: &SimulationCounters) {
+    let (fresh, stale) = counters.snapshot();
+    info!("simulation totals: fresh={}, stale={}", fresh, stale);
+}
+
+fn log_stale_simulation(counters: &SimulationCounters, message: &'static str) {
+    info!("{}", message);
+    counters.record_stale();
+    log_simulation_totals(counters);
+}
+
+async fn simulate_for_head(
+    provider: Provider<Ws>,
+    http_client: reqwest::Client,
+    http_url: &'static str,
+    head: HeadContext,
+    current_head_rx: watch::Receiver<Option<H256>>,
+    cancellation: CancellationToken,
+    counters: Arc<SimulationCounters>,
+) -> Result<()> {
+    let pending_block = tokio::select! {
+        _ = cancellation.cancelled() => {
+            log_stale_simulation(&counters, "simulation cancelled: stale head");
+            return Ok(());
+        }
+        pending_block = provider.get_block_with_txs(BlockNumber::Pending) => pending_block,
+    };
+
+    let pending_tx = match pending_block {
+        Ok(Some(block)) if !block.transactions.is_empty() => block.transactions[0].clone(),
+        Ok(_) => {
+            info!("Mempool empty");
+            return Ok(());
+        }
+        Err(e) => {
+            warn!("Pending block error: {}", e);
+            return Ok(());
+        }
+    };
+
+    info!("Simulating: {:#x}", pending_tx.hash);
+
+    let rpc_body = build_trace_call_body(&pending_tx, head.number);
+
+    let result_val = tokio::select! {
+        _ = cancellation.cancelled() => {
+            log_stale_simulation(&counters, "simulation cancelled: stale head");
+            return Ok(());
+        }
+        result = trace_call(&http_client, http_url, rpc_body) => match result {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("debug_traceCall failed: {}", e);
+                return Ok(());
+            }
+        },
+    };
+
+    let accounts_data = parse_prestate_diff(&result_val, 0);
+    let latest_head_hash = *current_head_rx.borrow();
+
+    if latest_head_hash != Some(head.hash) {
+        log_stale_simulation(&counters, "stale access set discarded");
+        return Ok(());
+    }
+
+    counters.record_fresh();
+    log_simulation_totals(&counters);
+
+    if accounts_data.is_empty() {
+        info!("No storage accesses in this tx, waiting for next head");
+        return Ok(());
+    }
+
+    let mut bal = BlockAccessListEncode::new(head.number, head.hash);
+    let mut total_reads = 0usize;
+    let mut total_writes = 0usize;
+
+    for (address, items) in accounts_data {
+        total_reads += items.iter().filter(|item| !item.dirty).count();
+        total_writes += items.iter().filter(|item| item.dirty).count();
+
+        let mut account = AccountAccessListEncode::new(0, address);
+        account.storage_items = items;
+        bal.accounts.push(account);
+    }
+
+    let encoded = bal.rlp_encode();
+
+    info!("─────────────────────────────────");
+    info!("BEP-592 payload generated");
+    info!("Block:    #{} {:#x}", head.number, head.hash);
+    info!("Tx:       {:#x}", pending_tx.hash);
+    info!("Accounts: {}", bal.accounts.len());
+    info!("Reads:    {}", total_reads);
+    info!("Writes:   {}", total_writes);
+    info!("Fresh:    yes");
+    info!("Size:     {} bytes", encoded.len());
+    info!("Hex:      {}", hex::encode(&encoded));
+    info!("─────────────────────────────────");
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -186,6 +391,9 @@ async fn main() -> Result<()> {
 
     let http_client = reqwest::Client::new();
     let mut stream = provider.subscribe_blocks().await?;
+    let counters = Arc::new(SimulationCounters::default());
+    let (current_head_tx, current_head_rx) = watch::channel::<Option<H256>>(None);
+    let mut active_simulation: Option<CancellationToken> = None;
 
     while let Some(block) = stream.next().await {
         let block_number = match block.number {
@@ -204,112 +412,44 @@ async fn main() -> Result<()> {
         };
 
         info!("New head: #{} {:#x}", block_number, block_hash);
+        let _ = current_head_tx.send(Some(block_hash));
 
-        // Fetch one pending transaction
-        let pending_tx = match provider
-            .get_block_with_txs(ethers::types::BlockNumber::Pending)
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = active_simulation.take() {
+            previous.cancel();
+        }
+        active_simulation = Some(cancellation.clone());
+
+        let head = HeadContext {
+            number: block_number,
+            hash: block_hash,
+        };
+        let provider = provider.clone();
+        let http_client = http_client.clone();
+        let current_head_rx = current_head_rx.clone();
+        let counters = Arc::clone(&counters);
+
+        tokio::spawn(async move {
+            if let Err(e) = simulate_for_head(
+                provider,
+                http_client,
+                http_url,
+                head,
+                current_head_rx,
+                cancellation,
+                counters,
+            )
             .await
-        {
-            Ok(Some(b)) if !b.transactions.is_empty() => b.transactions[0].clone(),
-            Ok(_) => {
-                info!("Mempool empty");
-                continue;
+            {
+                warn!("simulation task failed: {}", e);
             }
-            Err(e) => {
-                warn!("Pending block error: {}", e);
-                continue;
-            }
-        };
-
-        info!("Simulating: {:#x}", pending_tx.hash);
-
-        // Build call object from pending tx
-        let call_obj = serde_json::json!({
-            "from": format!("{:#x}", pending_tx.from),
-            "to": pending_tx.to.map(|a| format!("{:#x}", a)),
-            "data": format!("0x{}", hex::encode(pending_tx.input.as_ref())),
-            "gas": format!("{:#x}", pending_tx.gas),
-            "gasPrice": pending_tx.gas_price.map(|g| format!("{:#x}", g)),
-            "value": format!("{:#x}", pending_tx.value),
         });
-
-        // Use prestateTracer with diffMode to get storage reads and writes
-        let rpc_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "debug_traceCall",
-            "params": [
-                call_obj,
-                format!("{:#x}", block_number),
-                {
-                    "tracer": "prestateTracer",
-                    "tracerConfig": { "diffMode": true }
-                }
-            ],
-            "id": 1
-        });
-
-        let resp = match http_client.post(http_url).json(&rpc_body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("HTTP request failed: {}", e);
-                continue;
-            }
-        };
-
-        let resp_json: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Response parse failed: {}", e);
-                continue;
-            }
-        };
-
-        let result_val = match resp_json.get("result") {
-            Some(v) => v.clone(),
-            None => {
-                warn!(
-                    "No result field. Response: {}",
-                    serde_json::to_string(&resp_json).unwrap_or_default()
-                );
-                continue;
-            }
-        };
-
-        let accounts_data = parse_prestate_diff(&result_val, 0);
-
-        if accounts_data.is_empty() {
-            info!("No storage accesses in this tx, waiting for next head");
-            continue;
-        }
-
-        // Build BEP-592 payload
-        let mut bal = BlockAccessListEncode::new(block_number, block_hash);
-        let mut total_reads = 0usize;
-        let mut total_writes = 0usize;
-
-        for (address, items) in accounts_data {
-            total_reads += items.iter().filter(|i| !i.dirty).count();
-            total_writes += items.iter().filter(|i| i.dirty).count();
-            let mut account = AccountAccessListEncode::new(0, address);
-            account.storage_items = items;
-            bal.accounts.push(account);
-        }
-
-        let encoded = bal.rlp_encode();
-
-        info!("─────────────────────────────────");
-        info!("BEP-592 payload generated");
-        info!("Block:    #{} {:#x}", block_number, block_hash);
-        info!("Tx:       {:#x}", pending_tx.hash);
-        info!("Accounts: {}", bal.accounts.len());
-        info!("Reads:    {}", total_reads);
-        info!("Writes:   {}", total_writes);
-        info!("Size:     {} bytes", encoded.len());
-        info!("Hex:      {}", hex::encode(&encoded));
-        info!("─────────────────────────────────");
-        break;
     }
 
-    info!("Done.");
+    if let Some(active) = active_simulation.take() {
+        active.cancel();
+    }
+
+    info!("Head subscription ended.");
     Ok(())
 }
