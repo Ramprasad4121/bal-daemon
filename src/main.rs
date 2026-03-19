@@ -3,12 +3,13 @@ use ethers::providers::{Middleware, Provider, Ws};
 use ethers::types::{Address, BlockNumber, Transaction, H256};
 use futures_util::StreamExt;
 use rlp::RlpStream;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -47,6 +48,19 @@ struct HeadContext {
 struct SimulationCounters {
     fresh: AtomicU64,
     stale: AtomicU64,
+}
+
+#[derive(Debug)]
+struct SimulatedTransaction {
+    tx_index: u32,
+    accounts: Vec<(Address, Vec<StorageAccessItem>)>,
+}
+
+#[derive(Debug)]
+struct AccountAccumulator {
+    tx_index: u32,
+    address: Address,
+    storage_items: BTreeMap<[u8; 32], StorageAccessItem>,
 }
 
 impl StorageAccessItem {
@@ -280,6 +294,77 @@ fn log_stale_simulation(counters: &SimulationCounters, message: &'static str) {
     log_simulation_totals(counters);
 }
 
+async fn simulate_transaction(
+    http_client: reqwest::Client,
+    http_url: &'static str,
+    block_number: u64,
+    pending_tx: Transaction,
+    tx_index: u32,
+    cancellation: CancellationToken,
+) -> Result<Option<SimulatedTransaction>> {
+    let rpc_body = build_trace_call_body(&pending_tx, block_number);
+
+    let result_val = tokio::select! {
+        _ = cancellation.cancelled() => return Ok(None),
+        result = trace_call(&http_client, http_url, rpc_body) => result?,
+    };
+
+    Ok(Some(SimulatedTransaction {
+        tx_index,
+        accounts: parse_prestate_diff(&result_val, tx_index),
+    }))
+}
+
+fn merge_simulations(
+    head: HeadContext,
+    simulations: Vec<SimulatedTransaction>,
+) -> (BlockAccessListEncode, usize, usize, usize) {
+    let mut merged_accounts: BTreeMap<[u8; 20], AccountAccumulator> = BTreeMap::new();
+
+    for simulation in simulations {
+        for (address, items) in simulation.accounts {
+            let address_key: [u8; 20] = address.into();
+            let account =
+                merged_accounts
+                    .entry(address_key)
+                    .or_insert_with(|| AccountAccumulator {
+                        tx_index: simulation.tx_index,
+                        address,
+                        storage_items: BTreeMap::new(),
+                    });
+
+            account.tx_index = account.tx_index.min(simulation.tx_index);
+
+            for item in items {
+                if let Some(existing) = account.storage_items.get_mut(&item.key) {
+                    existing.tx_index = existing.tx_index.min(item.tx_index);
+                    existing.dirty |= item.dirty;
+                } else {
+                    account.storage_items.insert(item.key, item);
+                }
+            }
+        }
+    }
+
+    let mut bal = BlockAccessListEncode::new(head.number, head.hash);
+    let mut total_slots = 0usize;
+    let mut total_reads = 0usize;
+    let mut total_writes = 0usize;
+
+    for account in merged_accounts.into_values() {
+        let storage_items: Vec<_> = account.storage_items.into_values().collect();
+        total_slots += storage_items.len();
+        total_reads += storage_items.iter().filter(|item| !item.dirty).count();
+        total_writes += storage_items.iter().filter(|item| item.dirty).count();
+
+        let mut merged_account = AccountAccessListEncode::new(account.tx_index, account.address);
+        merged_account.storage_items = storage_items;
+        bal.accounts.push(merged_account);
+    }
+
+    (bal, total_slots, total_reads, total_writes)
+}
+
 async fn simulate_for_head(
     provider: Provider<Ws>,
     http_client: reqwest::Client,
@@ -298,7 +383,7 @@ async fn simulate_for_head(
     };
 
     let pending_tx = match pending_block {
-        Ok(Some(block)) if !block.transactions.is_empty() => block.transactions[0].clone(),
+        Ok(Some(block)) if !block.transactions.is_empty() => block.transactions,
         Ok(_) => {
             info!("Mempool empty");
             return Ok(());
@@ -309,51 +394,88 @@ async fn simulate_for_head(
         }
     };
 
-    info!("Simulating: {:#x}", pending_tx.hash);
+    let total_transactions = pending_tx.len();
+    info!("Simulating {} pending txs in parallel", total_transactions);
 
-    let rpc_body = build_trace_call_body(&pending_tx, head.number);
-
-    let result_val = tokio::select! {
-        _ = cancellation.cancelled() => {
-            log_stale_simulation(&counters, "simulation cancelled: stale head");
-            return Ok(());
-        }
-        result = trace_call(&http_client, http_url, rpc_body) => match result {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("debug_traceCall failed: {}", e);
+    let mut tx_tasks = JoinSet::new();
+    for (index, tx) in pending_tx.into_iter().enumerate() {
+        let tx_index = match u32::try_from(index) {
+            Ok(tx_index) => tx_index,
+            Err(_) => {
+                warn!("Pending tx index overflow: {}", index);
                 return Ok(());
             }
-        },
-    };
+        };
 
-    let accounts_data = parse_prestate_diff(&result_val, 0);
-    let latest_head_hash = *current_head_rx.borrow();
+        tx_tasks.spawn(simulate_transaction(
+            http_client.clone(),
+            http_url,
+            head.number,
+            tx,
+            tx_index,
+            cancellation.clone(),
+        ));
+    }
 
-    if latest_head_hash != Some(head.hash) {
+    let mut simulations = Vec::with_capacity(total_transactions);
+    while !tx_tasks.is_empty() {
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                tx_tasks.abort_all();
+                while let Some(_) = tx_tasks.join_next().await {}
+                log_stale_simulation(&counters, "simulation cancelled: stale head");
+                return Ok(());
+            }
+            join_result = tx_tasks.join_next() => {
+                let Some(join_result) = join_result else {
+                    break;
+                };
+
+                match join_result {
+                    Ok(Ok(Some(simulation))) => simulations.push(simulation),
+                    Ok(Ok(None)) => {
+                        tx_tasks.abort_all();
+                        while let Some(_) = tx_tasks.join_next().await {}
+                        log_stale_simulation(&counters, "simulation cancelled: stale head");
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        tx_tasks.abort_all();
+                        while let Some(_) = tx_tasks.join_next().await {}
+                        warn!("transaction simulation failed: {}", e);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tx_tasks.abort_all();
+                        while let Some(_) = tx_tasks.join_next().await {}
+                        warn!("transaction task join error: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    if *current_head_rx.borrow() != Some(head.hash) {
         log_stale_simulation(&counters, "stale access set discarded");
         return Ok(());
     }
 
-    counters.record_fresh();
-    log_simulation_totals(&counters);
+    let (bal, total_slots, total_reads, total_writes) = merge_simulations(head, simulations);
 
-    if accounts_data.is_empty() {
-        info!("No storage accesses in this tx, waiting for next head");
+    if *current_head_rx.borrow() != Some(head.hash) {
+        log_stale_simulation(&counters, "stale access set discarded");
         return Ok(());
     }
 
-    let mut bal = BlockAccessListEncode::new(head.number, head.hash);
-    let mut total_reads = 0usize;
-    let mut total_writes = 0usize;
-
-    for (address, items) in accounts_data {
-        total_reads += items.iter().filter(|item| !item.dirty).count();
-        total_writes += items.iter().filter(|item| item.dirty).count();
-
-        let mut account = AccountAccessListEncode::new(0, address);
-        account.storage_items = items;
-        bal.accounts.push(account);
+    let (fresh, stale) = counters.record_fresh();
+    if bal.accounts.is_empty() {
+        info!(
+            "No storage accesses across {} pending txs, waiting for next head",
+            total_transactions
+        );
+        info!("simulation totals: fresh={}, stale={}", fresh, stale);
+        return Ok(());
     }
 
     let encoded = bal.rlp_encode();
@@ -361,11 +483,13 @@ async fn simulate_for_head(
     info!("─────────────────────────────────");
     info!("BEP-592 payload generated");
     info!("Block:    #{} {:#x}", head.number, head.hash);
-    info!("Tx:       {:#x}", pending_tx.hash);
+    info!("Txs:      {}", total_transactions);
     info!("Accounts: {}", bal.accounts.len());
+    info!("Slots:    {}", total_slots);
     info!("Reads:    {}", total_reads);
     info!("Writes:   {}", total_writes);
-    info!("Fresh:    yes");
+    info!("Fresh:    {}", fresh);
+    info!("Stale:    {}", stale);
     info!("Size:     {} bytes", encoded.len());
     info!("Hex:      {}", hex::encode(&encoded));
     info!("─────────────────────────────────");
