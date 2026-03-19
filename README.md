@@ -50,9 +50,7 @@ I have the current daemon working on BSC Chapel testnet, and I have already exer
 - Integration test against real BSC Chapel testnet — passing
 
 Sample integration test output:
-
-- Block #96583654 — 2 accounts, 10 storage writes, 459-byte payload, PASS
-- Block #96581134 — 3 accounts, 13 storage writes, 594-byte payload, PASS
+![alt text](image-1.png)
 
 ## What's Next
 
@@ -70,5 +68,5 @@ GitHub issue: https://github.com/bnb-chain/bsc/issues/3596
 ## Author
 
 Ramprasad  
-github.com/Ramprasad4121  
-x.com/0xramprasad
+
+[x.com/0xramprasad](https://x.com/0xramprasad)
