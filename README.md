@@ -37,9 +37,31 @@ I use the normal Rust test suite plus the integration binary:
 ```bash
 cargo test && cargo run --bin integration_test
 ```
-![alt text](image.png)
 
 The integration test talks directly to NodeReal BSC testnet, walks back through recent blocks until it finds a contract interaction, traces it with `prestateTracer`, builds a BEP-592 payload, and verifies the RLP round-trip before reporting `PASS`.
+
+## Status
+
+I have the current daemon working on BSC Chapel testnet, and I have already exercised it against real contract interactions through NodeReal rather than only local fixtures.
+
+- New head subscription and staleness cancellation — done
+- Multi-transaction parallel simulation — done
+- BEP-592 RLP encoding — done and unit tested
+- Integration test against real BSC Chapel testnet — passing
+
+Sample integration test output:
+
+- Block #96583654 — 2 accounts, 10 storage writes, 459-byte payload, PASS
+- Block #96581134 — 3 accounts, 13 storage writes, 594-byte payload, PASS
+
+## What's Next
+
+The core simulation path is in place, so the next work is about scale, compatibility, and getting this in front of builders without forcing them to wire it in by hand.
+
+- Full mempool coverage at scale — needs load testing with hundreds of transactions per block
+- EIP-7928 encoder — same simulation core, different output format for the upcoming hardfork
+- Builder integration — JSON-RPC interface so builders can plug this in without code changes
+- Mainnet testing — run against BSC mainnet and measure real-world fresh vs stale payload rates
 
 ## Issue
 
