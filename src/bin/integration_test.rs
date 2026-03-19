@@ -1,14 +1,8 @@
-// Run a local BSC testnet node with debug methods enabled using Docker:
-// docker run -p 8545:8545 -p 8546:8546 ghcr.io/bnb-chain/bsc:latest \
-//   --http --http.api eth,debug,net,web3 \
-//   --ws --ws.api eth,debug,net,web3 \
-//   --datadir /data --testnet
-
 use anyhow::{anyhow, bail, Result};
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::{Address, BlockNumber, Transaction, H256};
 use reqwest::Client;
-use rlp::RlpStream;
+use rlp::{Rlp, RlpStream};
 use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{error, info};
@@ -256,8 +250,156 @@ fn build_bal_payload(
     (bal, total_accounts, total_reads, total_writes)
 }
 
+fn verify_round_trip(payload: &BlockAccessListEncode, encoded: &[u8]) -> Result<()> {
+    let decoded = Rlp::new(encoded);
+
+    let version: u32 = decoded.val_at(0)?;
+    if version != payload.version {
+        bail!(
+            "round-trip version mismatch: expected {}, got {}",
+            payload.version,
+            version
+        );
+    }
+
+    let number: u64 = decoded.val_at(1)?;
+    if number != payload.number {
+        bail!(
+            "round-trip block number mismatch: expected {}, got {}",
+            payload.number,
+            number
+        );
+    }
+
+    let hash: Vec<u8> = decoded.val_at(2)?;
+    if hash != payload.hash.to_vec() {
+        bail!("round-trip block hash mismatch");
+    }
+
+    let sign_data: Vec<u8> = decoded.val_at(3)?;
+    if sign_data != payload.sign_data {
+        bail!("round-trip sign_data mismatch");
+    }
+
+    let accounts = decoded.at(4)?;
+    let account_count = accounts.item_count()?;
+    if account_count != payload.accounts.len() {
+        bail!(
+            "round-trip account count mismatch: expected {}, got {}",
+            payload.accounts.len(),
+            account_count
+        );
+    }
+
+    for (account_index, expected_account) in payload.accounts.iter().enumerate() {
+        let account = accounts.at(account_index)?;
+
+        let tx_index: u32 = account.val_at(0)?;
+        if tx_index != expected_account.tx_index {
+            bail!(
+                "round-trip account tx_index mismatch at index {}: expected {}, got {}",
+                account_index,
+                expected_account.tx_index,
+                tx_index
+            );
+        }
+
+        let address: Vec<u8> = account.val_at(1)?;
+        if address != expected_account.address.to_vec() {
+            bail!(
+                "round-trip account address mismatch at index {}",
+                account_index
+            );
+        }
+
+        let storage_items = account.at(2)?;
+        let storage_count = storage_items.item_count()?;
+        if storage_count != expected_account.storage_items.len() {
+            bail!(
+                "round-trip storage item count mismatch at account {}: expected {}, got {}",
+                account_index,
+                expected_account.storage_items.len(),
+                storage_count
+            );
+        }
+
+        for (storage_index, expected_item) in expected_account.storage_items.iter().enumerate() {
+            let item = storage_items.at(storage_index)?;
+
+            let item_tx_index: u32 = item.val_at(0)?;
+            if item_tx_index != expected_item.tx_index {
+                bail!(
+                    "round-trip storage tx_index mismatch at account {}, item {}: expected {}, got {}",
+                    account_index,
+                    storage_index,
+                    expected_item.tx_index,
+                    item_tx_index
+                );
+            }
+
+            let dirty: u8 = item.val_at(1)?;
+            let expected_dirty = expected_item.dirty as u8;
+            if dirty != expected_dirty {
+                bail!(
+                    "round-trip dirty flag mismatch at account {}, item {}: expected {}, got {}",
+                    account_index,
+                    storage_index,
+                    expected_dirty,
+                    dirty
+                );
+            }
+
+            let key: Vec<u8> = item.val_at(2)?;
+            if key != expected_item.key.to_vec() {
+                bail!(
+                    "round-trip storage key mismatch at account {}, item {}",
+                    account_index,
+                    storage_index
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn find_contract_interaction(
+    provider: &Provider<Http>,
+    latest_block_number: u64,
+) -> Result<(u64, H256, Transaction)> {
+    for depth in 0..=5u64 {
+        let block_number = latest_block_number
+            .checked_sub(depth)
+            .ok_or_else(|| anyhow!("block walkback underflow at depth {}", depth))?;
+
+        let block = provider
+            .get_block_with_txs(BlockNumber::Number(block_number.into()))
+            .await?
+            .ok_or_else(|| anyhow!("block {} not found", block_number))?;
+
+        let block_hash = block
+            .hash
+            .ok_or_else(|| anyhow!("block {} missing hash", block_number))?;
+        let block_number = block
+            .number
+            .ok_or_else(|| anyhow!("block {} missing number", block_number))?
+            .as_u64();
+
+        if let Some(tx) = block
+            .transactions
+            .iter()
+            .find(|tx| !tx.input.as_ref().is_empty())
+            .cloned()
+        {
+            return Ok((block_number, block_hash, tx));
+        }
+    }
+
+    bail!("no contract interaction found in the latest 6 blocks");
+}
+
 async fn run_integration_test() -> Result<()> {
-    let rpc_url = "http://localhost:8545";
+    let rpc_url = "https://bsc-testnet.nodereal.io/v1/379e86e230114573aaa4a30d84d76b3e";
     let http_client = Client::builder().no_proxy().build()?;
     let provider = Provider::new(Http::new_with_client(
         reqwest::Url::parse(rpc_url)?,
@@ -265,34 +407,23 @@ async fn run_integration_test() -> Result<()> {
     ))
     .interval(Duration::from_millis(50));
 
-    info!("Connecting to local BSC node at {}", rpc_url);
+    info!("Connecting to NodeReal BSC testnet at {}", rpc_url);
 
-    let latest_block = provider
-        .get_block(BlockNumber::Latest)
-        .await?
-        .ok_or_else(|| anyhow!("latest block not found"))?;
-    let block_number = latest_block
-        .number
-        .ok_or_else(|| anyhow!("latest block missing number"))?
-        .as_u64();
-    let block_hash = latest_block
-        .hash
-        .ok_or_else(|| anyhow!("latest block missing hash"))?;
+    let latest_block_number = provider.get_block_number().await?.as_u64();
+    let (block_number, block_hash, tx) =
+        find_contract_interaction(&provider, latest_block_number).await?;
 
-    info!("Latest block: #{} {:#x}", block_number, block_hash);
+    info!("Block:    #{} {:#x}", block_number, block_hash);
+    info!("Tx:       {:#x}", tx.hash);
 
-    let pending_block = provider.get_block_with_txs(BlockNumber::Pending).await?;
-    let pending_tx = match pending_block {
-        Some(block) if !block.transactions.is_empty() => block.transactions[0].clone(),
-        _ => bail!("no pending transactions in mempool; submit one and rerun integration_test"),
-    };
-
-    info!("Pending tx selected: {:#x}", pending_tx.hash);
+    let parent_block_number = block_number
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("cannot trace a transaction from genesis block"))?;
 
     let trace_result = trace_call(
         &http_client,
         rpc_url,
-        build_trace_call_body(&pending_tx, block_number),
+        build_trace_call_body(&tx, parent_block_number),
     )
     .await?;
 
@@ -300,22 +431,13 @@ async fn run_integration_test() -> Result<()> {
         build_bal_payload(block_number, block_hash, &trace_result);
     let encoded = payload.rlp_encode();
     let payload_hex = hex::encode(&encoded);
+    verify_round_trip(&payload, &encoded)?;
 
-    let block_response: Option<serde_json::Value> = provider
-        .request("eth_getBlockByHash", (block_hash, false))
-        .await?;
-    if block_response.is_none() {
-        bail!("eth_getBlockByHash returned null for latest block hash");
-    }
-
-    info!("Payload hex: {}", payload_hex);
-    info!(
-        "Summary: accounts={}, storage_slots={}, reads={}, writes={}",
-        total_accounts,
-        total_reads + total_writes,
-        total_reads,
-        total_writes
-    );
+    info!("Accounts: {}", total_accounts);
+    info!("Reads:    {}", total_reads);
+    info!("Writes:   {}", total_writes);
+    info!("Size:     {} bytes", encoded.len());
+    info!("Hex:      {}", payload_hex);
     info!("PASS");
 
     Ok(())
