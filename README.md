@@ -37,6 +37,7 @@ I use the normal Rust test suite plus the integration binary:
 ```bash
 cargo test && cargo run --bin integration_test
 ```
+![alt text](image.png)
 
 The integration test talks directly to NodeReal BSC testnet, walks back through recent blocks until it finds a contract interaction, traces it with `prestateTracer`, builds a BEP-592 payload, and verifies the RLP round-trip before reporting `PASS`.
 
