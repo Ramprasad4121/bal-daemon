@@ -1,0 +1,49 @@
+[
+  {
+    "name": "verify_bal_payload",
+    "description": "Verifies whether a BEP-592 BAL payload is correctly RLP-encoded and structurally valid",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "payload_hex": {
+          "type": "string",
+          "description": "The hex-encoded RLP payload (with or without 0x prefix)"
+        }
+      },
+      "required": ["payload_hex"]
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "valid": { "type": "boolean" },
+        "accounts": { "type": "number" },
+        "reads": { "type": "number" },
+        "writes": { "type": "number" },
+        "error": { "type": ["string", "null"] }
+      }
+    }
+  },
+  {
+    "name": "get_block_bal_stats",
+    "description": "Fetches a block by number and returns stats on its BAL payload if present in the BSC protocol extension",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "block_number": {
+          "type": "string",
+          "description": "The block number in hex or decimal"
+        }
+      },
+      "required": ["block_number"]
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "has_bal": { "type": "boolean" },
+        "accounts": { "type": "number" },
+        "storage_slots": { "type": "number" },
+        "payload_size_bytes": { "type": "number" }
+      }
+    }
+  }
+]
