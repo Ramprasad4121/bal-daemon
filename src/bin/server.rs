@@ -41,6 +41,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -48,9 +49,10 @@ async fn main() {
         )
         .init();
 
+    let http_url = std::env::var("HTTP_URL").expect("HTTP_URL must be set in .env or environment");
     let state = Arc::new(AppState {
         http_client: reqwest::Client::new(),
-        http_url: "https://bsc-testnet.nodereal.io/v1/379e86e230114573aaa4a30d84d76b3e",
+        http_url: Box::leak(http_url.into_boxed_str()),
     });
 
     let app = Router::new()

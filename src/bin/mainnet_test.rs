@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
 
-const MAINNET_HTTP_URL: &str = "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3";
-const MAINNET_WSS_URL: &str = "wss://bsc-mainnet.nodereal.io/ws/v1/64a9df0874fb4a93b9d0a3849de012d3";
+const MAINNET_HTTP_URL: &str = "https://rpc.ankr.com/bsc/f6cc25e3dca4ab6cbd9ebea37296ddf30f6d663e3f5fcb3c9ab1d232c41efe2d";
+const MAINNET_WSS_URL: &str = "wss://rpc.ankr.com/bsc/ws/f6cc25e3dca4ab6cbd9ebea37296ddf30f6d663e3f5fcb3c9ab1d232c41efe2d";
 
 #[derive(Default)]
 struct MainnetCounters {
@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let mut target_blocks = Vec::new();
     let mut current_num = provider.get_block_number().await?.as_u64();
 
-    while target_blocks.len() < 5 {
+    while target_blocks.len() < 3 {
         info!("Fetching block {}...", current_num);
         let block = provider
             .get_block_with_txs(BlockId::from(current_num))
@@ -72,13 +72,13 @@ async fn main() -> anyhow::Result<()> {
         let block_hash = block.hash.unwrap();
         let mut txs = block.transactions;
         
-        // Cap at 20 transactions
-        if txs.len() > 20 {
-            txs.truncate(20);
+        // Cap at 5 transactions
+        if txs.len() > 5 {
+            txs.truncate(5);
         }
         let tx_count = txs.len();
 
-        info!("Simulating block #{} (capped at {} txs with 200ms stagger)...", block_num, tx_count);
+        info!("Simulating block #{} (capped at {} txs with 1000ms stagger)...", block_num, tx_count);
 
         let start = Instant::now();
         let mut tx_tasks = JoinSet::new();
@@ -87,8 +87,8 @@ async fn main() -> anyhow::Result<()> {
             let client = http_client.clone();
             let counters = Arc::clone(&counters);
             tx_tasks.spawn(async move {
-                // Staggered start: index * 200ms
-                tokio::time::sleep(Duration::from_millis(index as u64 * 200)).await;
+                // Staggered start: index * 1000ms
+                tokio::time::sleep(Duration::from_millis(index as u64 * 1000)).await;
                 simulate_mined_with_retry(client, tx.hash, index as u32, counters).await
             });
         }
@@ -153,8 +153,8 @@ async fn simulate_mined_with_retry(
         }),
         Err(e) if e.to_string().contains("429") => {
             counters.rate_limited.fetch_add(1, Ordering::Relaxed);
-            warn!("Rate limited on tx {:#x}, retrying in 2s...", tx_hash);
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            warn!("Rate limited on tx {:#x}, retrying in 10s...", tx_hash);
+            tokio::time::sleep(Duration::from_secs(10)).await;
             
             match trace_call(&client, MAINNET_HTTP_URL, rpc_body).await {
                 Ok(res) => {
@@ -195,8 +195,8 @@ async fn measure_staleness(mainnet_counters: Arc<MainnetCounters>) -> anyhow::Re
                     error!("Max reconnect attempts reached. Ending test early.");
                     break;
                 }
-                warn!("WS connect failed: {}. Retrying in 3s...", e);
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                warn!("WS connect failed: {}. Retrying in 5s...", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
         };
@@ -264,7 +264,7 @@ async fn measure_staleness(mainnet_counters: Arc<MainnetCounters>) -> anyhow::Re
         if start_time.elapsed() >= duration {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
     let (fresh, stale) = sim_counters.snapshot();
@@ -303,13 +303,13 @@ async fn simulate_live_head(
     };
 
     let mut tx_tasks = JoinSet::new();
-    for (index, tx) in txs.into_iter().take(20).enumerate() {
+    for (index, tx) in txs.into_iter().take(5).enumerate() {
         let client = http_client.clone();
         let cancel = cancellation.clone();
         let mainnet_counters = Arc::clone(&mainnet_counters);
         
         tx_tasks.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(index as u64 * 200)).await;
+            tokio::time::sleep(Duration::from_millis(index as u64 * 1000)).await;
             
             let rpc_body = build_trace_call_body(&tx, head.number);
             let mut result = tokio::select! {
@@ -320,7 +320,7 @@ async fn simulate_live_head(
             if let Err(ref e) = result {
                 if e.to_string().contains("429") {
                     mainnet_counters.rate_limited.fetch_add(1, Ordering::Relaxed);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                     result = tokio::select! {
                         _ = cancel.cancelled() => return None,
                         res = trace_call(&client, MAINNET_HTTP_URL, rpc_body) => {

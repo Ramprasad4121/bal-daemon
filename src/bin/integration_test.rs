@@ -399,10 +399,11 @@ async fn find_contract_interaction(
 }
 
 async fn run_integration_test() -> Result<()> {
-    let rpc_url = "https://bsc-testnet.nodereal.io/v1/379e86e230114573aaa4a30d84d76b3e";
+    dotenv::dotenv().ok();
+    let rpc_url = std::env::var("HTTP_URL").expect("HTTP_URL must be set in .env or environment");
     let http_client = Client::builder().no_proxy().build()?;
     let provider = Provider::new(Http::new_with_client(
-        reqwest::Url::parse(rpc_url)?,
+        reqwest::Url::parse(&rpc_url)?,
         http_client.clone(),
     ))
     .interval(Duration::from_millis(50));
@@ -422,7 +423,7 @@ async fn run_integration_test() -> Result<()> {
 
     let trace_result = trace_call(
         &http_client,
-        rpc_url,
+        &rpc_url,
         build_trace_call_body(&tx, parent_block_number),
     )
     .await?;

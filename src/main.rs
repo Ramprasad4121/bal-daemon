@@ -12,7 +12,7 @@ use tracing::{info, warn};
 async fn simulate_for_head(
     provider: Provider<Ws>,
     http_client: reqwest::Client,
-    http_url: &'static str,
+    http_url: Arc<str>,
     head: HeadContext,
     current_head_rx: watch::Receiver<Option<H256>>,
     cancellation: CancellationToken,
@@ -52,14 +52,20 @@ async fn simulate_for_head(
             }
         };
 
-        tx_tasks.spawn(simulate_transaction(
-            http_client.clone(),
-            http_url,
-            head.number,
-            tx,
-            tx_index,
-            Some(cancellation.clone()),
-        ));
+        let http_client = http_client.clone();
+        let http_url = http_url.clone();
+        let cancellation = cancellation.clone();
+
+        tx_tasks.spawn(async move {
+            simulate_transaction(
+                http_client,
+                &http_url,
+                head.number,
+                tx,
+                tx_index,
+                Some(cancellation),
+            ).await
+        });
     }
 
     let mut simulations = Vec::with_capacity(total_transactions);
@@ -155,11 +161,13 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let ws_url = "wss://bsc-testnet.nodereal.io/ws/v1/379e86e230114573aaa4a30d84d76b3e";
-    let http_url = "https://bsc-testnet.nodereal.io/v1/379e86e230114573aaa4a30d84d76b3e";
+    let ws_url = std::env::var("WS_URL").unwrap_or_else(|_| "wss://bsc-testnet.nodereal.io/ws/v1/126472ffb03f4b28a87e6b772ababb34".to_string());
+    let http_url: Arc<str> = std::env::var("HTTP_URL")
+        .unwrap_or_else(|_| "https://bsc-testnet.nodereal.io/v1/126472ffb03f4b28a87e6b772ababb34".to_string())
+        .into();
 
     info!("Connecting to {}", ws_url);
-    let provider = Provider::<Ws>::connect(ws_url).await?;
+    let provider = Provider::<Ws>::connect(&ws_url).await?;
     info!("Connected. Waiting for new heads...");
 
     let http_client = reqwest::Client::new();
@@ -199,6 +207,7 @@ async fn main() -> Result<()> {
         };
         let provider = provider.clone();
         let http_client = http_client.clone();
+        let http_url = http_url.clone();
         let current_head_rx = current_head_rx.clone();
         let counters = Arc::clone(&counters);
 

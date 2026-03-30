@@ -61,8 +61,10 @@ async fn main() -> anyhow::Result<()> {
     }))?);
 
     // 2. get_block_bal_stats test
+    dotenv::dotenv().ok();
+    let rpc_url = std::env::var("HTTP_URL").expect("HTTP_URL must be set in .env or environment");
     let block_number = 96583654;
-    let provider = Provider::<Http>::try_from("https://bsc-testnet.nodereal.io/v1/379e86e230114573aaa4a30d84d76b3e")?;
+    let provider = Provider::<Http>::try_from(&rpc_url)?;
     
     let block_json: serde_json::Value = provider.request("eth_getBlockByNumber", (format!("{:#x}", block_number), false)).await?;
     

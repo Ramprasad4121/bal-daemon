@@ -5,8 +5,6 @@ use std::time::Instant;
 use tokio::task::JoinSet;
 use tracing::{error, info};
 
-const NODE_REAL_URL: &str = "https://bsc-testnet.nodereal.io/v1/379e86e230114573aaa4a30d84d76b3e";
-
 struct BlockStats {
     number: u64,
     tx_count: usize,
@@ -20,6 +18,7 @@ struct BlockStats {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -27,7 +26,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let provider = Provider::<Http>::try_from(NODE_REAL_URL)?;
+    let node_real_url = std::env::var("HTTP_URL").expect("HTTP_URL must be set in .env or environment");
+    let provider = Provider::<Http>::try_from(&node_real_url)?;
     let http_client = reqwest::Client::new();
 
     info!("Starting load test on NodeReal BSC Testnet...");
@@ -69,8 +69,9 @@ async fn main() -> anyhow::Result<()> {
 
         for (index, tx) in txs.into_iter().enumerate() {
             let client = http_client.clone();
+            let url = node_real_url.clone();
             tx_tasks.spawn(async move {
-                simulate_mined_transaction(client, NODE_REAL_URL, tx.hash, index as u32).await
+                simulate_mined_transaction(client, &url, tx.hash, index as u32).await
             });
         }
 
@@ -122,9 +123,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn print_summary_table(stats: Vec<BlockStats>) {
-    println!("\n┌──────────┬────────┬─────────┬────────┬──────────┬──────────┬──────────┬──────────┐");
-    println!("│ Block    │ Txs    │ Success │ Fail   │ Time(ms) │ TPS      │ Accounts │ Slots    │");
-    println!("├──────────┼────────┼─────────┼────────┼──────────┼──────────┼──────────┼──────────┤");
+    println!("\n+----------+--------+---------+--------+----------+----------+----------+----------+");
+    println!("| Block    | Txs    | Success | Fail   | Time(ms) | TPS      | Accounts | Slots    |");
+    println!("+----------+--------+---------+--------+----------+----------+----------+----------+");
 
     let mut total_txs = 0;
     let mut total_success = 0;
@@ -141,7 +142,7 @@ fn print_summary_table(stats: Vec<BlockStats>) {
         };
 
         println!(
-            "│ {:<8} │ {:<6} │ {:<7} │ {:<6} │ {:<8} │ {:<8.2} │ {:<8} │ {:<8} │",
+            "| {:<8} | {:<6} | {:<7} | {:<6} | {:<8} | {:<8.2} | {:<8} | {:<8} |",
             s.number, s.tx_count, s.success_count, s.fail_count, s.time_ms, tps, s.accounts, s.slots
         );
 
@@ -153,15 +154,15 @@ fn print_summary_table(stats: Vec<BlockStats>) {
         total_slots += s.slots;
     }
 
-    println!("├──────────┼────────┼─────────┼────────┼──────────┼──────────┼──────────┼──────────┤");
+    println!("+----------+--------+---------+--------+----------+----------+----------+----------+");
     let avg_tps = if total_time_ms > 0 {
         (total_txs as f64 / (total_time_ms as f64 / 1000.0))
     } else {
         0.0
     };
     println!(
-        "│ TOTAL    │ {:<6} │ {:<7} │ {:<6} │ {:<8} │ {:<8.2} │ {:<8} │ {:<8} │",
+        "| TOTAL    | {:<6} | {:<7} | {:<6} | {:<8} | {:<8.2} | {:<8} | {:<8} |",
         total_txs, total_success, total_fail, total_time_ms, avg_tps, total_accounts, total_slots
     );
-    println!("└──────────┴────────┴─────────┴────────┴──────────┴──────────┴──────────┴──────────┘\n");
+    println!("+----------+--------+---------+--------+----------+----------+----------+----------+\n");
 }
