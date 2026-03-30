@@ -166,7 +166,9 @@ Response:
 ## Author
 
 Ramprasad
-github.com/Ramprasad4121
-x.com/0xramprasad
+
+https://github.com/Ramprasad4121
+
+https://x.com/0xramprasad
 
 Related: https://github.com/bnb-chain/bsc/issues/3596
